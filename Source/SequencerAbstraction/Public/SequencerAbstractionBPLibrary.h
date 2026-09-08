@@ -224,6 +224,9 @@ public:
     UFUNCTION(BlueprintCallable, Category = "SequencerAbstraction|Sequencer")
     static int32 GetCurrentFrame(FString& ErrorMessage);
 
+    UFUNCTION(BlueprintPure, Category = "SequencerAbstraction|Sequencer")
+    static bool currentlyScrubbing();
+
     UFUNCTION(BlueprintCallable, Category = "SequencerAbstraction|Sequencer", meta = (DisplayName = "sequencerTimeChanged"))
     static bool sequencerTimeChanged();
 

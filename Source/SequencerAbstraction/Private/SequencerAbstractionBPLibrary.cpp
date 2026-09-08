@@ -1429,7 +1429,10 @@ FGuid USequencerAbstractionBPLibrary::FindOrCreatePossessableBinding(
         {
             if (UWorld* World = Actor->GetWorld())
             {
+                Sequence->Modify();
+                Sequence->UnbindPossessableObjects(Binding.GetObjectGuid());
                 Sequence->BindPossessableObject(Binding.GetObjectGuid(), *Actor, World);
+                Sequence->MarkPackageDirty();
             }
 
             Result.bSuccess = true;
@@ -1490,7 +1493,10 @@ FGuid USequencerAbstractionBPLibrary::FindPossessableBinding(
         {
             if (UWorld* World = Actor->GetWorld())
             {
+                Sequence->Modify();
+                Sequence->UnbindPossessableObjects(Binding.GetObjectGuid());
                 Sequence->BindPossessableObject(Binding.GetObjectGuid(), *Actor, World);
+                Sequence->MarkPackageDirty();
             }
 
             Result.bSuccess = true;
@@ -2516,6 +2522,45 @@ int32 USequencerAbstractionBPLibrary::GetCurrentFrame(FString& ErrorMessage)
 
     return FrameTime.FrameNumber.Value;
 
+#endif
+}
+
+bool USequencerAbstractionBPLibrary::currentlyScrubbing()
+{
+#if !WITH_EDITOR
+    return false;
+#else
+    if (ULevelSequenceEditorBlueprintLibrary::IsPlaying())
+    {
+        return true;
+    }
+
+    ULevelSequence* Sequence = USequencerAbstractionBPLibrary::GetCurrentOpenedLevelSequence();
+    if (!Sequence || !GEditor)
+    {
+        return false;
+    }
+
+    UAssetEditorSubsystem* EditorSubsystem = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>();
+    if (!EditorSubsystem)
+    {
+        return false;
+    }
+
+    IAssetEditorInstance* EditorInstance = EditorSubsystem->FindEditorForAsset(Sequence, /*bFocusIfOpen*/ false);
+    if (!EditorInstance)
+    {
+        return false;
+    }
+
+    ILevelSequenceEditorToolkit* Toolkit = static_cast<ILevelSequenceEditorToolkit*>(EditorInstance);
+    if (!Toolkit)
+    {
+        return false;
+    }
+
+    TSharedPtr<ISequencer> Sequencer = Toolkit->GetSequencer();
+    return Sequencer.IsValid() && Sequencer->GetPlaybackStatus() == EMovieScenePlayerStatus::Scrubbing;
 #endif
 }
 
