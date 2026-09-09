@@ -10,8 +10,10 @@
 #include "MovieSceneSection.h"
 #include "MovieSceneTimeUnit.h"
 #include "MovieSceneTrack.h"
+#include "MovieSceneScriptingFloat.h"
 #include "Channels/MovieSceneChannel.h"
 #include "Channels/MovieSceneChannelProxy.h"
+#include "Channels/MovieSceneFloatChannel.h"
 #include "ControlRig.h"
 #include "ExtensionLibraries/MovieSceneSectionExtensions.h"
 #include "MovieSceneScriptingChannel.h"
@@ -50,6 +52,26 @@ TArray<UMovieSceneScriptingChannel*> USequencerAbstractionBPLibrary::GetAllChann
     }
 
     return AllChannels;
+}
+
+bool USequencerAbstractionBPLibrary::EvaluateFloatChannelAtTime(
+    UMovieSceneScriptingFloatChannel* Channel,
+    FFrameTime Time,
+    float& OutValue)
+{
+    OutValue = 0.0f;
+
+    if (!Channel || !Channel->OwningSection.IsValid())
+    {
+        return false;
+    }
+
+    FMovieSceneChannelProxy& ChannelProxy = Channel->OwningSection->GetChannelProxy();
+    TMovieSceneChannelHandle<FMovieSceneFloatChannel> FloatChannelHandle =
+        ChannelProxy.GetChannelByName<FMovieSceneFloatChannel>(Channel->ChannelName);
+
+    const FMovieSceneFloatChannel* FloatChannel = FloatChannelHandle.Get();
+    return FloatChannel && FloatChannel->Evaluate(Time, OutValue);
 }
 
 static FString GetScriptingKeyValueString(UMovieSceneScriptingKey* Key)
@@ -1176,6 +1198,141 @@ int32 USequencerAbstractionBPLibrary::FocusSequencerRowsForNames(
                 BaseKeySelection.Select(KeyAndChannel.Value, KeyAndChannel.Key);
             }
         }
+    }
+
+    return UniqueMatchedChannelNames.Num();
+#endif
+}
+
+int32 USequencerAbstractionBPLibrary::FocusSequencerSectionsForNames(
+    UMovieSceneTrack* Track,
+    const TArray<FName>& Names,
+    bool bMatchContains,
+    bool bClearExistingSelection,
+    bool bThrobSelection,
+    bool bFrameMatchedSections,
+    double ViewPaddingSeconds,
+    FString& ErrorMessage)
+{
+    ErrorMessage.Empty();
+
+#if !WITH_EDITOR
+    ErrorMessage = TEXT("Editor only.");
+    return 0;
+#else
+    if (!Track)
+    {
+        ErrorMessage = TEXT("Track is null.");
+        return 0;
+    }
+
+    TSharedPtr<ISequencer> Sequencer = EnsureOpenSequencerForTrack(Track, ErrorMessage);
+    if (!Sequencer.IsValid())
+    {
+        return 0;
+    }
+
+    TArray<TSharedPtr<UE::Sequencer::FChannelModel>> Channels;
+    GatherChannelsForTrack(Sequencer, Track, Channels);
+
+    TSet<UMovieSceneSection*> MatchedSections;
+    TSet<FName> UniqueMatchedChannelNames;
+    for (const TSharedPtr<UE::Sequencer::FChannelModel>& Channel : Channels)
+    {
+        if (!Channel)
+        {
+            continue;
+        }
+
+        UMovieSceneSection* Section = Channel->GetSection();
+        if (!Section)
+        {
+            continue;
+        }
+
+        FName RequestedName = NAME_None;
+        bool bMatches = DoesChannelMatchAnyRequestedName(Channel->GetChannelName(), Names, bMatchContains, RequestedName);
+
+        if (!bMatches)
+        {
+            if (UMovieSceneControlRigParameterSection* ControlRigSection = Cast<UMovieSceneControlRigParameterSection>(Section))
+            {
+                if (FMovieSceneChannel* MovieSceneChannel = Channel->GetChannel())
+                {
+                    const UE::MovieScene::FControlRigChannelMetaData ControlRigMetaData =
+                        ControlRigSection->GetChannelMetaData(MovieSceneChannel);
+                    bMatches = ControlRigMetaData &&
+                        DoesChannelMatchAnyRequestedName(ControlRigMetaData.GetControlName(), Names, bMatchContains, RequestedName);
+                }
+            }
+        }
+
+        if (!bMatches)
+        {
+            continue;
+        }
+
+        MatchedSections.Add(Section);
+        UniqueMatchedChannelNames.Add(Channel->GetChannelName());
+    }
+
+    if (MatchedSections.Num() == 0)
+    {
+        ErrorMessage = TEXT("No Sequencer sections matched the requested names.");
+        return 0;
+    }
+
+    if (bClearExistingSelection)
+    {
+        TSharedPtr<UE::Sequencer::FSequencerSelection> Selection =
+            Sequencer->GetViewModel().IsValid() ? Sequencer->GetViewModel()->GetSelection() : nullptr;
+        if (Selection)
+        {
+            Selection->TrackArea.Empty();
+            Selection->Outliner.Empty();
+            UE::Sequencer::TUniqueFragmentSelectionSet<FKeyHandle, UE::Sequencer::FChannelModel>& BaseKeySelection = Selection->KeySelection;
+            BaseKeySelection.Empty();
+        }
+    }
+
+    bool bHasSectionBounds = false;
+    FFrameNumber MinFrame(TNumericLimits<int32>::Max());
+    FFrameNumber MaxFrame(TNumericLimits<int32>::Lowest());
+
+    for (UMovieSceneSection* Section : MatchedSections)
+    {
+        if (!Section)
+        {
+            continue;
+        }
+
+        Sequencer->SelectSection(Section);
+
+        const TRange<FFrameNumber> SectionRange = Section->GetRange();
+        if (SectionRange.HasLowerBound() && SectionRange.HasUpperBound())
+        {
+            MinFrame = FMath::Min(MinFrame, SectionRange.GetLowerBoundValue());
+            MaxFrame = FMath::Max(MaxFrame, SectionRange.GetUpperBoundValue());
+            bHasSectionBounds = true;
+        }
+    }
+
+    if (bThrobSelection)
+    {
+        Sequencer->ThrobSectionSelection();
+    }
+
+    if (bFrameMatchedSections && bHasSectionBounds && MinFrame < MaxFrame)
+    {
+        const FFrameRate TickResolution = Sequencer->GetFocusedTickResolution();
+        const double StartSeconds = TickResolution.AsSeconds(MinFrame);
+        const double EndSeconds = TickResolution.AsSeconds(MaxFrame);
+        const double PaddingSeconds = FMath::Max(0.0, ViewPaddingSeconds);
+        Sequencer->SetViewRange(
+            TRange<double>(
+                StartSeconds - PaddingSeconds,
+                EndSeconds + PaddingSeconds),
+            EViewRangeInterpolation::Animated);
     }
 
     return UniqueMatchedChannelNames.Num();

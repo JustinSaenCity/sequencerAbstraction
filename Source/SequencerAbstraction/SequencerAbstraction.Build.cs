@@ -29,6 +29,7 @@ public class SequencerAbstraction : ModuleRules
             PrivateDependencyModuleNames.AddRange(new[]
             {
                 "UnrealEd",
+                "EditorSubsystem",
                 "AssetTools",
                 "AssetRegistry",
                 "ContentBrowser",

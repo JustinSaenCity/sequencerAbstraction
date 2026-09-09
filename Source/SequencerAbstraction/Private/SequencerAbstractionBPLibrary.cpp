@@ -239,15 +239,93 @@ bool USequencerAbstractionBPLibrary::GetCurrentFloatValueFromRigBindingProxy(
         return false;
     }
 
-    const FFrameTime CurrentTime = ULevelSequenceEditorBlueprintLibrary::GetCurrentTime();
-    OutValue = UControlRigSequencerEditorLibrary::GetLocalControlRigFloat(
-        Sequence,
-        ControlRig,
-        ControlName,
-        CurrentTime.FrameNumber,
-        EMovieSceneTimeUnit::DisplayRate);
+    if (!RigBinding.Proxy.BindingID.IsValid())
+    {
+        ErrorMessage = TEXT("Rig binding proxy has an invalid BindingID.");
+        return false;
+    }
 
-    return true;
+    if (RigBinding.Proxy.Sequence != Sequence)
+    {
+        ErrorMessage = TEXT("Rig binding proxy does not belong to the currently opened Level Sequence.");
+        return false;
+    }
+
+    UMovieSceneControlRigParameterTrack* Track = RigBinding.Track;
+    if (!Track)
+    {
+        ErrorMessage = TEXT("Rig binding proxy has no Control Rig parameter track.");
+        return false;
+    }
+
+    if (Track->GetControlRig() != ControlRig)
+    {
+        ErrorMessage = TEXT("Rig binding proxy track does not reference the same Control Rig instance.");
+        return false;
+    }
+
+    FRigControlElement* ControlElement = ControlRig->FindControl(ControlName);
+    if (!ControlElement)
+    {
+        ErrorMessage = FString::Printf(
+            TEXT("Control Rig does not contain control '%s'."),
+            *ControlName.ToString());
+        return false;
+    }
+
+    const ERigControlType ControlType = ControlElement->Settings.ControlType;
+    if (ControlType != ERigControlType::Float && ControlType != ERigControlType::ScaleFloat)
+    {
+        ErrorMessage = FString::Printf(
+            TEXT("Control '%s' is not a float control."),
+            *ControlName.ToString());
+        return false;
+    }
+
+    const FMovieSceneSequencePlaybackParams CurrentTickPosition =
+        ULevelSequenceEditorBlueprintLibrary::GetGlobalPosition(EMovieSceneTimeUnit::TickResolution);
+    const FFrameTime CurrentTickTime = CurrentTickPosition.Frame;
+
+    UMovieSceneControlRigParameterSection* FirstScalarSection = nullptr;
+    for (UMovieSceneSection* RawSection : Track->GetAllSections())
+    {
+        UMovieSceneControlRigParameterSection* Section = Cast<UMovieSceneControlRigParameterSection>(RawSection);
+        if (!Section || !Section->HasScalarParameter(ControlName))
+        {
+            continue;
+        }
+
+        if (!FirstScalarSection)
+        {
+            FirstScalarSection = Section;
+        }
+
+        if (Section->GetRange().Contains(CurrentTickTime.FrameNumber))
+        {
+            const TOptional<float> EvaluatedValue = Section->EvaluateScalarParameter(CurrentTickTime, ControlName);
+            if (EvaluatedValue.IsSet())
+            {
+                OutValue = EvaluatedValue.GetValue();
+                return true;
+            }
+        }
+    }
+
+    if (FirstScalarSection)
+    {
+        const TOptional<float> EvaluatedValue = FirstScalarSection->EvaluateScalarParameter(CurrentTickTime, ControlName);
+        if (EvaluatedValue.IsSet())
+        {
+            OutValue = EvaluatedValue.GetValue();
+            return true;
+        }
+    }
+
+    ErrorMessage = FString::Printf(
+        TEXT("No scalar channel found for control '%s' on the proxy's Control Rig track."),
+        *ControlName.ToString());
+    return false;
+
 #endif
 }
 
@@ -1351,7 +1429,10 @@ FGuid USequencerAbstractionBPLibrary::FindOrCreatePossessableBinding(
         {
             if (UWorld* World = Actor->GetWorld())
             {
+                Sequence->Modify();
+                Sequence->UnbindPossessableObjects(Binding.GetObjectGuid());
                 Sequence->BindPossessableObject(Binding.GetObjectGuid(), *Actor, World);
+                Sequence->MarkPackageDirty();
             }
 
             Result.bSuccess = true;
@@ -1378,6 +1459,55 @@ FGuid USequencerAbstractionBPLibrary::FindOrCreatePossessableBinding(
         Result.Error = TEXT("Failed to create possessable binding.");
     }
     return BindingGuid;
+}
+
+FGuid USequencerAbstractionBPLibrary::FindPossessableBinding(
+    ULevelSequence* Sequence,
+    AActor* Actor,
+    FSequenceOpenResult& Result)
+{
+    Result = {};
+
+    if (!Sequence || !Actor)
+    {
+        Result.Error = TEXT("Sequence or Actor is null.");
+        return FGuid();
+    }
+
+    UMovieScene* MovieScene = Sequence->GetMovieScene();
+    if (!MovieScene)
+    {
+        Result.Error = TEXT("Sequence has no MovieScene.");
+        return FGuid();
+    }
+
+    const FString ActorLabel = Actor->GetActorLabel();
+    const UClass* ActorClass = Actor->GetClass();
+
+    for (const FMovieSceneBinding& Binding : static_cast<const UMovieScene*>(MovieScene)->GetBindings())
+    {
+        FMovieScenePossessable* Possessable = MovieScene->FindPossessable(Binding.GetObjectGuid());
+        if (Possessable &&
+            Possessable->GetName() == ActorLabel &&
+            Possessable->GetPossessedObjectClass() == ActorClass)
+        {
+            if (UWorld* World = Actor->GetWorld())
+            {
+                Sequence->Modify();
+                Sequence->UnbindPossessableObjects(Binding.GetObjectGuid());
+                Sequence->BindPossessableObject(Binding.GetObjectGuid(), *Actor, World);
+                Sequence->MarkPackageDirty();
+            }
+
+            Result.bSuccess = true;
+            return Binding.GetObjectGuid();
+        }
+    }
+
+    Result.Error = FString::Printf(
+        TEXT("No possessable binding found for actor '%s'."),
+        *ActorLabel);
+    return FGuid();
 }
 
 bool USequencerAbstractionBPLibrary::SnapSectionToSourceTimecode(
@@ -2306,6 +2436,71 @@ UMovieSceneTrack* USequencerAbstractionBPLibrary::GetTrackFromGuid(
 #endif
 }
 
+UMovieSceneControlRigParameterTrack* USequencerAbstractionBPLibrary::GetControlRigTrackFromGuid(
+    ULevelSequence* Sequence,
+    FGuid BindingGuid,
+    TSubclassOf<UControlRig> ControlRigClass,
+    FString& ErrorMessage)
+{
+#if !WITH_EDITOR
+    ErrorMessage = TEXT("Editor only.");
+    return nullptr;
+#else
+
+    ErrorMessage.Empty();
+
+    if (!Sequence)
+    {
+        ErrorMessage = TEXT("Sequence is null.");
+        return nullptr;
+    }
+
+    UMovieScene* MovieScene = Sequence->GetMovieScene();
+    if (!MovieScene)
+    {
+        ErrorMessage = TEXT("MovieScene is null.");
+        return nullptr;
+    }
+
+    const FMovieSceneBinding* Binding = MovieScene->FindBinding(BindingGuid);
+    if (!Binding)
+    {
+        ErrorMessage = TEXT("Binding GUID not found.");
+        return nullptr;
+    }
+
+    UClass* TargetControlRigClass = ControlRigClass.Get();
+    for (UMovieSceneTrack* Track : Binding->GetTracks())
+    {
+        UMovieSceneControlRigParameterTrack* ControlRigTrack = Cast<UMovieSceneControlRigParameterTrack>(Track);
+        if (!ControlRigTrack)
+        {
+            continue;
+        }
+
+        UControlRig* ControlRig = ControlRigTrack->GetControlRig();
+        if (!TargetControlRigClass || (ControlRig && ControlRig->GetClass()->IsChildOf(TargetControlRigClass)))
+        {
+            return ControlRigTrack;
+        }
+    }
+
+    if (TargetControlRigClass)
+    {
+        ErrorMessage = FString::Printf(
+            TEXT("No Control Rig track found for class '%s'."),
+            *TargetControlRigClass->GetName());
+    }
+    else
+    {
+        ErrorMessage = TEXT("No Control Rig track found.");
+    }
+
+    return nullptr;
+
+#endif
+}
+
 int32 USequencerAbstractionBPLibrary::GetCurrentFrame(FString& ErrorMessage)
 {
 #if !WITH_EDITOR
@@ -2327,6 +2522,45 @@ int32 USequencerAbstractionBPLibrary::GetCurrentFrame(FString& ErrorMessage)
 
     return FrameTime.FrameNumber.Value;
 
+#endif
+}
+
+bool USequencerAbstractionBPLibrary::currentlyScrubbing()
+{
+#if !WITH_EDITOR
+    return false;
+#else
+    if (ULevelSequenceEditorBlueprintLibrary::IsPlaying())
+    {
+        return true;
+    }
+
+    ULevelSequence* Sequence = USequencerAbstractionBPLibrary::GetCurrentOpenedLevelSequence();
+    if (!Sequence || !GEditor)
+    {
+        return false;
+    }
+
+    UAssetEditorSubsystem* EditorSubsystem = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>();
+    if (!EditorSubsystem)
+    {
+        return false;
+    }
+
+    IAssetEditorInstance* EditorInstance = EditorSubsystem->FindEditorForAsset(Sequence, /*bFocusIfOpen*/ false);
+    if (!EditorInstance)
+    {
+        return false;
+    }
+
+    ILevelSequenceEditorToolkit* Toolkit = static_cast<ILevelSequenceEditorToolkit*>(EditorInstance);
+    if (!Toolkit)
+    {
+        return false;
+    }
+
+    TSharedPtr<ISequencer> Sequencer = Toolkit->GetSequencer();
+    return Sequencer.IsValid() && Sequencer->GetPlaybackStatus() == EMovieScenePlayerStatus::Scrubbing;
 #endif
 }
 

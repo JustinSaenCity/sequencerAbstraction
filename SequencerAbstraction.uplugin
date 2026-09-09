@@ -25,6 +25,10 @@
             "Enabled": true
         },
         {
+            "Name": "MediaCompositing",
+            "Enabled": true
+        },
+        {
             "Name": "RigVM",
             "Enabled": true
         },
